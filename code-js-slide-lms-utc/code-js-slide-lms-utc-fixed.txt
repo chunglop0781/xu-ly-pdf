@@ -1,0 +1,394 @@
+
+(async () => {
+    const viewer = document.querySelector(".pdfViewer_11613b7f");
+
+    if (!viewer) {
+        console.error("Không tìm thấy PDF Viewer!");
+        return;
+    }
+
+    const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+    const originalScroll = viewer.scrollTop;
+
+    // ==========================================
+    // 1. TÌM CÁC TRANG PDF TRONG DOM
+    // ==========================================
+
+    function getPages() {
+        const viewerRect = viewer.getBoundingClientRect();
+
+        return [...viewer.querySelectorAll("div")]
+            .filter(el =>
+                [...el.classList].some(cls =>
+                    /^page_[\w-]+$/i.test(cls)
+                )
+            )
+            .map(el => {
+                const rect = el.getBoundingClientRect();
+
+                return {
+                    el,
+                    top: viewer.scrollTop + rect.top - viewerRect.top,
+                    width: rect.width,
+                    height: rect.height,
+                    label: el.getAttribute("aria-label")
+                };
+            })
+            .filter(p =>
+                p.width > viewer.clientWidth * 0.6 &&
+                p.height > 100
+            );
+    }
+
+    // ==========================================
+    // 2. QUÉT TOÀN BỘ TÀI LIỆU
+    // Không giới hạn số trang
+    // ==========================================
+
+    console.log("BẮT ĐẦU QUÉT TOÀN BỘ PDF...");
+
+    const positions = [];
+
+    const scanStep = Math.max(
+        200,
+        Math.floor(viewer.clientHeight * 0.5)
+    );
+
+    let scanY = 0;
+    let lastBottom = -1;
+    let bottomStable = 0;
+
+    viewer.scrollTop = 0;
+
+    try {
+        while (true) {
+            const maxBefore =
+                viewer.scrollHeight - viewer.clientHeight;
+
+            const target = Math.min(scanY, maxBefore);
+
+            viewer.scrollTop = target;
+
+            await sleep(300);
+
+            positions.push(...getPages());
+
+            const maxNow =
+                viewer.scrollHeight - viewer.clientHeight;
+
+            if (viewer.scrollTop >= maxNow - 2) {
+                await sleep(500);
+
+                positions.push(...getPages());
+
+                const maxSettled =
+                    viewer.scrollHeight - viewer.clientHeight;
+
+                if (maxSettled === lastBottom) {
+                    bottomStable++;
+                } else {
+                    bottomStable = 0;
+                }
+
+                lastBottom = maxSettled;
+
+                if (bottomStable >= 2) {
+                    break;
+                }
+
+                scanY = maxSettled;
+            } else {
+                scanY = target + scanStep;
+            }
+        }
+
+        // Sắp xếp theo vị trí từ trên xuống dưới
+        positions.sort((a, b) => a.top - b.top);
+
+        // Loại bỏ trang trùng
+        const pages = [];
+
+        for (const p of positions) {
+            const previous = pages[pages.length - 1];
+
+            if (previous && Math.abs(previous.top - p.top) < 12) {
+                if (!previous.label && p.label) {
+                    previous.label = p.label;
+                }
+                continue;
+            }
+
+            pages.push({
+                top: p.top,
+                label: p.label,
+                width: p.width,
+                height: p.height
+            });
+        }
+
+        if (pages.length === 0) {
+            console.error("Không tìm thấy trang PDF!");
+            return;
+        }
+
+        console.log("ĐÃ QUÉT XONG:", pages.length, "SLIDE");
+
+        console.table(pages.map((p, i) => ({
+            STT: i + 1,
+            Trang: p.label || "Không có nhãn",
+            Top: Math.round(p.top),
+            Width: Math.round(p.width),
+            Height: Math.round(p.height)
+        })));
+
+        // ==========================================
+        // 3. XUẤT TỪNG SLIDE THÀNH PNG
+        // ==========================================
+
+        let successCount = 0;
+        let errorCount = 0;
+        let consecutiveErrors = 0;
+
+        const failed = [];
+
+        async function exportPage(page, index) {
+            const maxScroll =
+                viewer.scrollHeight - viewer.clientHeight;
+
+            // Đưa trang vào vùng hiển thị
+            viewer.scrollTop = Math.min(page.top, maxScroll);
+
+            // Chờ SharePoint render
+            await sleep(1800);
+
+            // Tìm lại phần tử trang sau khi render
+            const currentPages = getPages();
+
+            const current = [...currentPages].sort((a, b) =>
+                Math.abs(a.top - page.top) -
+                Math.abs(b.top - page.top)
+            )[0];
+
+            if (!current || Math.abs(current.top - page.top) > 12) {
+                throw new Error("Không tìm thấy đúng phần tử trang");
+            }
+
+            const canvas = viewer.querySelector("canvas");
+
+            if (!canvas || canvas.width === 0 || canvas.height === 0) {
+                throw new Error("Canvas không hợp lệ");
+            }
+
+            const pr = current.el.getBoundingClientRect();
+            const cr = canvas.getBoundingClientRect();
+
+            if (cr.width <= 0 || cr.height <= 0) {
+                throw new Error("Canvas chưa hiển thị");
+            }
+
+            const scaleX = canvas.width / cr.width;
+            const scaleY = canvas.height / cr.height;
+
+            const sx = (pr.left - cr.left) * scaleX;
+            const sy = (pr.top - cr.top) * scaleY;
+            const sw = pr.width * scaleX;
+            const sh = pr.height * scaleY;
+
+            // ======================================
+            // 4. SỬA LỖI TỌA ĐỘ ÂM / VƯỢT CANVAS
+            // Cho phép sai số tối đa 3 pixel
+            // ======================================
+
+            const tolerance = 3;
+
+            if (
+                sx < -tolerance ||
+                sy < -tolerance ||
+                sx + sw > canvas.width + tolerance ||
+                sy + sh > canvas.height + tolerance
+            ) {
+                throw new Error(
+                    `Trang vượt Canvas: ` +
+                    `x=${sx.toFixed(2)}, y=${sy.toFixed(2)}, ` +
+                    `right=${(sx + sw).toFixed(2)}, ` +
+                    `bottom=${(sy + sh).toFixed(2)}`
+                );
+            }
+
+            // Giới hạn tọa độ vào vùng Canvas thực tế
+            const sourceLeft = Math.max(0, sx);
+            const sourceTop = Math.max(0, sy);
+
+            const sourceRight = Math.min(
+                canvas.width,
+                sx + sw
+            );
+
+            const sourceBottom = Math.min(
+                canvas.height,
+                sy + sh
+            );
+
+            const sourceWidth = sourceRight - sourceLeft;
+            const sourceHeight = sourceBottom - sourceTop;
+
+            if (sourceWidth <= 0 || sourceHeight <= 0) {
+                throw new Error("Vùng ảnh không hợp lệ");
+            }
+
+            // Kích thước ảnh đầu ra
+            const output = document.createElement("canvas");
+
+            output.width = Math.round(sw);
+            output.height = Math.round(sh);
+
+            const ctx = output.getContext("2d");
+
+            if (!ctx) {
+                throw new Error("Không tạo được Canvas xuất ảnh");
+            }
+
+            // Nền trắng bù phần sai số nhỏ ở mép ảnh
+            ctx.fillStyle = "#FFFFFF";
+            ctx.fillRect(0, 0, output.width, output.height);
+
+            // Tọa độ đích tương ứng với phần nguồn hợp lệ
+            const destX =
+                ((sourceLeft - sx) / sw) * output.width;
+
+            const destY =
+                ((sourceTop - sy) / sh) * output.height;
+
+            const destWidth =
+                (sourceWidth / sw) * output.width;
+
+            const destHeight =
+                (sourceHeight / sh) * output.height;
+
+            // Cắt chính xác nội dung từ Canvas
+            ctx.drawImage(
+                canvas,
+                sourceLeft,
+                sourceTop,
+                sourceWidth,
+                sourceHeight,
+                destX,
+                destY,
+                destWidth,
+                destHeight
+            );
+
+            // ======================================
+            // 5. CHUYỂN THÀNH PNG
+            // ======================================
+
+            const blob = await new Promise(resolve => {
+                output.toBlob(resolve, "image/png");
+            });
+
+            if (!blob || blob.size === 0) {
+                throw new Error("Không tạo được file PNG");
+            }
+
+            const filename =
+                `slide_${String(index).padStart(3, "0")}.png`;
+
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement("a");
+
+            a.href = url;
+            a.download = filename;
+
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+
+            setTimeout(() => URL.revokeObjectURL(url), 30000);
+
+            return {
+                filename,
+                width: output.width,
+                height: output.height,
+                sizeKB: Math.round(blob.size / 1024),
+                cropY: sy.toFixed(2)
+            };
+        }
+
+        // ==========================================
+        // 6. XUẤT TẤT CẢ SLIDE
+        // Dừng khi lỗi 5 slide liên tiếp
+        // ==========================================
+
+        console.log("BẮT ĐẦU XUẤT PNG...");
+
+        for (let i = 0; i < pages.length; i++) {
+            const slideNumber = i + 1;
+
+            try {
+                const result = await exportPage(
+                    pages[i],
+                    slideNumber
+                );
+
+                successCount++;
+                consecutiveErrors = 0;
+
+                console.log(
+                    `✅ [${slideNumber}/${pages.length}]`,
+                    result.filename,
+                    `${result.width} × ${result.height}`,
+                    `${result.sizeKB} KB`,
+                    `Y=${result.cropY}`
+                );
+
+            } catch (error) {
+                errorCount++;
+                consecutiveErrors++;
+
+                failed.push({
+                    slide: slideNumber,
+                    page: pages[i].label,
+                    error: error.message
+                });
+
+                console.error(
+                    `❌ [${slideNumber}/${pages.length}]`,
+                    error.message,
+                    `Lỗi liên tiếp: ${consecutiveErrors}/5`
+                );
+
+                if (consecutiveErrors >= 5) {
+                    console.error(
+                        "ĐÃ DỪNG: 5 SLIDE LỖI LIÊN TIẾP!"
+                    );
+                    break;
+                }
+            }
+
+            await sleep(400);
+        }
+
+        // ==========================================
+        // 7. TỔNG KẾT
+        // ==========================================
+
+        console.log("======================================");
+        console.log("HOÀN THÀNH!");
+        console.log("Tổng slide phát hiện:", pages.length);
+        console.log("Xuất thành công:", successCount);
+        console.log("Slide lỗi:", errorCount);
+        console.log("Lỗi liên tiếp:", consecutiveErrors);
+        console.log("======================================");
+
+        if (failed.length > 0) {
+            console.log("DANH SÁCH SLIDE LỖI:");
+            console.table(failed);
+        }
+
+    } catch (error) {
+        console.error("LỖI CHƯƠNG TRÌNH:", error);
+
+    } finally {
+        viewer.scrollTop = originalScroll;
+    }
+})();
